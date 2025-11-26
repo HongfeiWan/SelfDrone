@@ -1,2 +1,0 @@
-# SelfDrone
-Selfrace Drone

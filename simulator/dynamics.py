@@ -567,71 +567,17 @@ class QuadrotorDynamics:
         
         return motorRPM
 
-class DiscreteActionSpace:
-    """
-    离散动作空间定义，支持三维jerk控制
-    对于地面车辆（自行车模型），z轴jerk始终为0
-    """
-    def __init__(self, config: Dict, device: torch.device):
-        """
-        初始化离散动作空间
-        Args:
-            config: 配置字典，包含jerk范围参数
-            device: 计算设备
-        """
-        if config is None:
-            config = {}
-        # 定义离散动作：三维jerk [jerk_x, jerk_y, jerk_z]
-        # jerk_x (纵向): [-15, -4, 0, 4] m/s³
-        # jerk_y (横向): [-4, 0, 4] m/s³
-        # jerk_z (垂直): 始终为0（地面车辆）
-        min_long_jerk = config.get('min_longitudinal_jerk', -15.0)
-        max_long_jerk = config.get('max_longitudinal_jerk', 4.0)
-        min_lat_jerk = config.get('min_lateral_jerk', -4.0)
-        max_lat_jerk = config.get('max_lateral_jerk', 4.0)
-        
-        self.jerk_x_values = [min_long_jerk, -max_long_jerk, 0, max_long_jerk]
-        self.jerk_y_values = [min_lat_jerk, 0, max_lat_jerk]
-        
-        # 创建所有可能的动作组合（三维jerk，z始终为0）
-        self.actions = []
-        for jerk_x in self.jerk_x_values:
-            for jerk_y in self.jerk_y_values:
-                self.actions.append([jerk_x, jerk_y, 0.0])  # [jerk_x, jerk_y, jerk_z=0]
-        self.num_actions = len(self.actions)  # 12个动作
-        self.actions_tensor = torch.tensor(self.actions, dtype=torch.float32, device=device)
-
-    def get_action(self, action_idx: torch.Tensor) -> torch.Tensor:
-        """
-        根据动作索引获取实际动作值（三维jerk）
-        Args:
-            action_idx: 动作索引张量，形状为 (N,) 或标量
-            
-        Returns:
-            torch.Tensor: 实际动作值，形状为 (N, 3) 或 (3,)
-                格式: [jerk_x, jerk_y, jerk_z=0]
-        """
-        if action_idx.ndim == 0:  # 标量
-            return self.actions_tensor[action_idx]
-        else:  # 批量
-            return self.actions_tensor[action_idx]
-        
-    def get_all_actions(self) -> torch.Tensor:
-        """获取所有动作（三维jerk）"""
-        return self.actions_tensor
-
 class KinematicBicycleModel:
     """
     实现了一个精确且批量化的运动学自行车模型（三维jerk控制）。
     该模型使用运动学方程的解析解，以确保在离散时间步长内的物理准确性，
     特别是在转弯场景中。所有操作都已完全向量化，以实现最高性能。
     使用三维jerk控制：
-    - 动作格式: [jerk_x, jerk_y, jerk_z] (3维)
-    - jerk_x: 纵向jerk (x方向，前进/后退)
-    - jerk_y: 横向jerk (y方向，左右)
-    - jerk_z: 垂直jerk (z方向，对于地面车辆始终为0)
-    
-    支持离散动作空间，通过jerk控制实现平滑的加速度变化。
+    - 动作格式: [jerk_x, jerk_y, jerk_z] (3维)，形状为 (N, 3)
+    - jerk_x: 纵向jerk (x方向，前进/后退) (m/s³)
+    - jerk_y: 横向jerk (y方向，左右) (m/s³)
+    - jerk_z: 垂直jerk (z方向，对于地面车辆始终为0) (m/s³)
+    通过jerk控制实现平滑的加速度变化。
     """
     def __init__(self, config: Dict, device: torch.device):
         """
@@ -687,9 +633,6 @@ class KinematicBicycleModel:
         self.curvature_epsilon = float(dynamics_config.get('curvature_epsilon', 1e-5))      # 曲率计算的数值稳定性参数
         #self.steering_epsilon = float(dynamics_config.get('steering_epsilon', 1e-5))       # 转向角计算的数值稳定性参数
         #self.straight_motion_threshold = float(dynamics_config.get('straight_motion_threshold', 1e-5))  # 直线运动判断阈值 (rad)
-
-        # 使用离散动作空间
-        self.discrete_action_space = DiscreteActionSpace(dynamics_config, device)
         
         # 当前加速度状态（用于jerk控制）
         # 这些将在step方法中根据批量大小动态调整
@@ -702,23 +645,22 @@ class KinematicBicycleModel:
         对一批车辆状态进行一步精确更新（使用三维jerk控制）。
         Args:
             states (torch.Tensor): 形状为 (N, 4) 的当前状态张量 [x, y, yaw, speed]。
-            actions (torch.Tensor): 动作索引张量，形状为 (N,)，对应离散动作空间中的索引。
-                离散动作空间返回三维jerk: [jerk_x, jerk_y, jerk_z=0]
-                - jerk_x: 纵向jerk (x方向)
-                - jerk_y: 横向jerk (y方向)
-                - jerk_z: 垂直jerk (始终为0，地面车辆)
+            actions (torch.Tensor): 三维jerk控制动作，形状为 (N, 3) [jerk_x, jerk_y, jerk_z]
+                - jerk_x: 纵向jerk (x方向，前进/后退) (m/s³)
+                - jerk_y: 横向jerk (y方向，左右) (m/s³)
+                - jerk_z: 垂直jerk (z方向，对于地面车辆始终为0) (m/s³)
             dt (float): 模拟时间步长 (s)。
         Returns:
             torch.Tensor: 形状为 (N, 4) 的下一时刻状态张量。
         """
         # 检查输入维度
         assert states.ndim == 2 and states.shape[1] == 4, f"States shape must be (N, 4), but got {states.shape}"
+        assert actions.ndim == 2 and actions.shape[1] == 3, f"Actions shape must be (N, 3) [jerk_x, jerk_y, jerk_z], but got {actions.shape}"
         # 获取批次大小
         batch_size = states.shape[0]
-        # 离散动作空间：actions是动作索引
-        assert actions.ndim == 1, f"Discrete actions shape must be (N,), but got {actions.shape}"
         # 使用批量wheelbase参数，要求batch_size与车辆参数数量匹配
         assert batch_size == self.num_vehicles, f"batch_size ({batch_size}) must match num_vehicles ({self.num_vehicles})"
+        assert batch_size == actions.shape[0], f"batch_size ({batch_size}) must match actions.shape[0] ({actions.shape[0]})"
         wheelbases = self.vehicle_params['wheelbase']  # (batch_size,)
         
         # 检查并初始化控制状态（确保batch_size正确）
@@ -731,8 +673,8 @@ class KinematicBicycleModel:
             if hasattr(self, 'prev_along'):
                 self.prev_along = torch.zeros(batch_size, device=self.device)
         
-        # 获取实际的三维jerk动作
-        jerk_actions = self.discrete_action_space.get_action(actions)  # (N, 3) [jerk_x, jerk_y, jerk_z]
+        # 直接使用三维jerk动作（actions已经是jerk值）
+        jerk_actions = actions  # (N, 3) [jerk_x, jerk_y, jerk_z]
         # 更新当前加速度和转向角（jerk控制）
         # 对于地面车辆，只使用x和y方向的jerk，z方向jerk始终为0
         along_jerk = jerk_actions[:, 0]  # 纵向jerk (x方向)
@@ -936,10 +878,6 @@ class KinematicBicycleModel:
         steering_angle = torch.atan(curvature * L_used)
         return steering_angle
     
-    def get_discrete_action_space(self) -> DiscreteActionSpace:
-        """获取离散动作空间"""
-        return self.discrete_action_space
-
     def _sample_driving_style(self, size: int):
         """
         采样驾驶风格参数（内部方法）
@@ -1057,7 +995,7 @@ if __name__ == "__main__":
     states = initial_states
     for i in range(10):
         states = quad.step(states, actions_quad, dt)
-        if i % 5 == 0:
+        if i % 1 == 0:
             pos = states[:, :3]
             vel = states[:, 7:10]
             print(f"Step {i}:")
@@ -1097,14 +1035,16 @@ if __name__ == "__main__":
         [0.0, 0.0, 1.57, 3.0]  # 车辆2: 在原点，朝y方向，速度3m/s
     ], device=device)
     
-    # 离散动作索引（对应3维jerk: [jerk_x, jerk_y, jerk_z=0]）
-    # 动作空间有12个离散动作，这里使用动作索引
-    actions_bike = torch.tensor([0, 5], device=device)  # 选择不同的离散动作
+    # 三维jerk控制动作: [jerk_x, jerk_y, jerk_z=0]
+    actions_bike = torch.tensor([
+        [2.0, 0.0, 0.0],   # 车辆1: 正向纵向jerk
+        [0.0, 1.0, 0.0]    # 车辆2: 正向横向jerk
+    ], device=device)
     
     states = initial_states
     for i in range(10):
         states = bike.step(states, actions_bike, dt)
-        if i % 5 == 0:
+        if i % 1 == 0:
             print(f"Step {i}:")
             print(f"  States:\n{states}")
     

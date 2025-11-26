@@ -1,231 +1,249 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
+"""
+基于区块（Chunk）的地图生成系统 - 完全GPU加速
+- 每个区块：16×16×256 体素
+- 每个体素：0.5m×0.5m×0.5m
+- 视野范围：21×21 区块（以agent为中心）
+- 支持动态加载新区块
+- 所有体素数据存储在GPU上作为tensor
+- 暴露体素计算完全在GPU上完成
+- 使用vispy的GPU高速渲染
+"""
 import numpy as np
-import random
-from vispy import app, gloo, scene
+import torch
+import json
+import os
+import time
+from typing import Dict, Tuple, Optional, List
+from concurrent.futures import ThreadPoolExecutor
+from vispy import app, scene, gloo
 from vispy.util.transforms import perspective, translate, rotate
+from vispy.geometry import MeshData
 
+# 加载配置文件
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), '../config/defalt_config.json')
+with open(CONFIG_PATH, 'r') as f:
+    CONFIG = json.load(f)
+    CHUNK_CONFIG = CONFIG.get('chunk')
+    HORIZON = CONFIG.get('horizon')
 
-# ============================================================
-# 1. 生成体素城市
-# ============================================================
+class Section:
+    def __init__(self, section_y: int, chunk, device):
+        self.section_y = section_y  # 从chunk底部起第几层section
+        self.chunk = chunk          # 所属chunk，可用于反查
+        self.voxels = torch.zeros(
+            (chunk.CHUNK_SIZE_X, chunk.CHUNK_SECTION_HEIGHT, chunk.CHUNK_SIZE_Z),
+            dtype=torch.uint8, device=device)
 
-def generate_city(width=64, depth=64, max_height=40, seed=1,
-                  road_interval=(10, 20), road_width=3,
-                  building_density=0.7, min_b=3, max_b=8):
-    grid = np.zeros((width, depth, max_height), dtype=np.uint8)
-    rng = random.Random(seed)
+class Chunk:
+    """
+    区块类：存储 16×16×256 的体素数据，每个chunk用chunk_x、chunk_z索引
+    """
+    CHUNK_SIZE_X = CHUNK_CONFIG.get('CHUNK_SIZE_X')
+    CHUNK_SIZE_Z = CHUNK_CONFIG.get('CHUNK_SIZE_Z')
+    CHUNK_SECTION_HEIGHT = CHUNK_CONFIG.get('SECTION_HEIGHT')  # 每 section 高度
+    CHUNK_SIZE_Y = CHUNK_CONFIG.get('CHUNK_SIZE_Y')             # 总高度
+    VOXEL_SIZE = CHUNK_CONFIG.get('VOXEL_SIZE')
 
-    # ---- Roads ----
-    xs, x = [], 0
-    while x < width:
-        x += rng.randint(*road_interval)
-        if x < width:
-            xs.append(x)
+    def __init__(self, chunk_x: int, chunk_z: int, device: torch.device):
+        self.chunk_x = chunk_x
+        self.chunk_z = chunk_z
+        self.device = device
+        self.num_sections = int(np.ceil(self.CHUNK_SIZE_Y / self.CHUNK_SECTION_HEIGHT))
+        # 直接分配全chunk四维大张量：[section, x, y_in_section, z]
+        self.voxels_all = torch.zeros(
+            (self.num_sections, self.CHUNK_SIZE_X, self.CHUNK_SECTION_HEIGHT, self.CHUNK_SIZE_Z),
+            dtype=torch.uint8, device=device)
+        self._generate_ground()
 
-    ys, y = [], 0
-    while y < depth:
-        y += rng.randint(*road_interval)
-        if y < depth:
-            ys.append(y)
+    @staticmethod
+    def world_to_chunk_idx(x: float, z: float) -> Tuple[int, int]:
+        idx_x = int(np.floor(x / (Chunk.CHUNK_SIZE_X * Chunk.VOXEL_SIZE)))
+        idx_z = int(np.floor(z / (Chunk.CHUNK_SIZE_Z * Chunk.VOXEL_SIZE)))
+        return idx_x, idx_z
 
-    for rx in xs:
-        grid[rx - road_width // 2:rx + road_width // 2 + 1, :, 0] = 1
-    for ry in ys:
-        grid[:, ry - road_width // 2:ry + road_width // 2 + 1, 0] = 1
+    def get_world_bounds(self) -> Tuple[float, float, float, float]:
+        min_x = self.chunk_x * self.CHUNK_SIZE_X * self.VOXEL_SIZE
+        max_x = (self.chunk_x + 1) * self.CHUNK_SIZE_X * self.VOXEL_SIZE
+        min_z = self.chunk_z * self.CHUNK_SIZE_Z * self.VOXEL_SIZE
+        max_z = (self.chunk_z + 1) * self.CHUNK_SIZE_Z * self.VOXEL_SIZE
+        return min_x, max_x, min_z, max_z
 
-    occ = grid[:, :, 0] != 0
+    def get_center(self) -> Tuple[float, float]:
+        min_x, max_x, min_z, max_z = self.get_world_bounds()
+        center_x = (min_x + max_x) / 2
+        center_z = (min_z + max_z) / 2
+        return center_x, center_z
 
-    # ---- Buildings ----
-    for i in range(width):
-        for j in range(depth):
-            if occ[i, j]:
-                continue
-            if rng.random() > building_density:
-                continue
+    def _generate_ground(self):
+        # 地面层在全chunk的y=0，位于第0个section的第0行
+        self.voxels_all[0, :, 0, :] = 1
 
-            bw = rng.randint(min_b, max_b)
-            bd = rng.randint(min_b, max_b)
-            if i + bw >= width or j + bd >= depth:
-                continue
-            if occ[i:i+bw, j:j+bd].any():
-                continue
+    def get_section_idx_for_y(self, world_y: float) -> int:
+        # 全局y -> chunk内section索引
+        idx = int(np.floor(world_y / (self.CHUNK_SECTION_HEIGHT * self.VOXEL_SIZE)))
+        if 0 <= idx < self.num_sections:
+            return idx
+        raise IndexError('y坐标不在此chunk覆盖的区间内')
 
-            occ[i:i+bw, j:j+bd] = True
-            h = rng.randint(4, max_height - 3)
-            for xi in range(i, i+bw):
-                for yj in range(j, j+bd):
-                    for z in range(1, h):
-                        grid[xi, yj, z] = 2
-                    grid[xi, yj, h] = 3  # roof
+    def get_voxel(self, world_x: float, world_y: float, world_z: float) -> int:
+        # 转为chunk内local坐标
+        lx = int(np.floor((world_x - self.get_world_bounds()[0]) / self.VOXEL_SIZE))
+        lz = int(np.floor((world_z - self.get_world_bounds()[2]) / self.VOXEL_SIZE))
+        section_idx = self.get_section_idx_for_y(world_y)
+        y_local = int(np.floor(world_y / self.VOXEL_SIZE)) % self.CHUNK_SECTION_HEIGHT
+        return int(self.voxels_all[section_idx, lx, y_local, lz].item())
 
-    return grid
+    def set_voxel(self, world_x: float, world_y: float, world_z: float, value: int):
+        lx = int(np.floor((world_x - self.get_world_bounds()[0]) / self.VOXEL_SIZE))
+        lz = int(np.floor((world_z - self.get_world_bounds()[2]) / self.VOXEL_SIZE))
+        section_idx = self.get_section_idx_for_y(world_y)
+        y_local = int(np.floor(world_y / self.VOXEL_SIZE)) % self.CHUNK_SECTION_HEIGHT
+        self.voxels_all[section_idx, lx, y_local, lz] = value
 
+    def contains_point(self, world_x: float, world_y: float, world_z: float) -> bool:
+        min_x, max_x, min_z, max_z = self.get_world_bounds()
+        min_y = 0.0
+        max_y = self.num_sections * self.CHUNK_SECTION_HEIGHT * self.VOXEL_SIZE
+        return (
+            min_x <= world_x < max_x and
+            min_y <= world_y < max_y and
+            min_z <= world_z < max_z
+        )
 
-# ============================================================
-# 2. 曝露的体素
-# ============================================================
+    def to(self, device: torch.device):
+        """将Chunk数据移动到指定设备"""
+        if self.device != device:
+            self.device = device
+            self.voxels_all = self.voxels_all.to(device)
+        return self
 
-def get_exposed_voxels(grid):
-    w, d, h = grid.shape
-    voxels = []
-    for x in range(w):
-        for y in range(d):
-            for z in range(h):
-                if grid[x, y, z] == 0:
-                    continue
-                exposed = False
-                for nx, ny, nz in [(x-1,y,z),(x+1,y,z),(x,y-1,z),(x,y+1,z),(x,y,z-1),(x,y,z+1)]:
-                    if nx<0 or ny<0 or nz<0 or nx>=w or ny>=d or nz>=h:
-                        exposed = True; break
-                    if grid[nx,ny,nz] == 0:
-                        exposed = True; break
-                if exposed:
-                    voxels.append((x,y,z, grid[x,y,z]))
-    return np.array(voxels, dtype=np.int32)
+class Agent:
+    """
+    Agent类：表示在环境中移动的智能体
+    具有长、宽、高三个维度属性，以及当前位置信息
+    """
+    def __init__(self, length: float, width: float, height: float, 
+                 initial_x: float = 0.0, initial_y: float = 0.0, initial_z: float = 0.0,
+                 initial_qw: float = 1.0, initial_qx: float = 0.0, 
+                 initial_qy: float = 0.0, initial_qz: float = 0.0,
+                 device: Optional[torch.device] = None):
+        """
+        初始化Agent
+        Args:
+            length: Agent的长度（x方向，米）
+            width: Agent的宽度（z方向，米）
+            height: Agent的高度（y方向，米）
+            initial_x: 初始x位置（世界坐标，米）
+            initial_y: 初始y位置（世界坐标，米）
+            initial_z: 初始z位置（世界坐标，米）
+            initial_qw: 初始四元数w分量（姿态）
+            initial_qx: 初始四元数x分量（姿态）
+            initial_qy: 初始四元数y分量（姿态）
+            initial_qz: 初始四元数z分量（姿态）
+            device: 计算设备（GPU或CPU）
+        """
+        self.length = length      # x方向长度
+        self.width = width        # z方向宽度
+        self.height = height      # y方向高度
+        
+        # 当前位置（世界坐标）
+        self.x = initial_x
+        self.y = initial_y
+        self.z = initial_z
+        
+        # 当前姿态（四元数：w, x, y, z）
+        self.qw = initial_qw
+        self.qx = initial_qx
+        self.qy = initial_qy
+        self.qz = initial_qz
 
+        self.device = device if device is not None else torch.device("cpu")
+    
+    def update_position(self, new_x: float, new_y: float, new_z: float):
+        """
+        更新Agent的位置
+        Args:
+            new_x: 新的x位置
+            new_y: 新的y位置
+            new_z: 新的z位置
+        """
+        self.x = new_x
+        self.y = new_y
+        self.z = new_z
+    
+    def update_orientation(self, new_qw: float, new_qx: float, new_qy: float, new_qz: float):
+        """
+        更新Agent的姿态（四元数）
+        Args:
+            new_qw: 新的四元数w分量
+            new_qx: 新的四元数x分量
+            new_qy: 新的四元数y分量
+            new_qz: 新的四元数z分量
+        """
+        self.qw = new_qw
+        self.qx = new_qx
+        self.qy = new_qy
+        self.qz = new_qz
+    
+    def get_bounding_box(self) -> Dict[str, float]:
+        """
+        获取Agent的包围盒（考虑长宽高）
+        Returns:
+            {'x_min': x_min, 'x_max': x_max, 'z_min': z_min, 'z_max': z_max, 
+             'y_min': y_min, 'y_max': y_max}
+        """
+        half_length = self.length / 2
+        half_width = self.width / 2
+        return {
+            'x_min': self.x - half_length,
+            'x_max': self.x + half_length,
+            'z_min': self.z - half_width,
+            'z_max': self.z + half_width,
+            'y_min': self.y,
+            'y_max': self.y + self.height
+        }
 
-# ============================================================
-# 3. VisPy instanced cube
-# ============================================================
+if __name__=="__main__":
+    # 示例：在世界坐标(0, 2, 0) 生成一个agent
+    device = torch.device("cuda")
+    agent = Agent(length=1.0, width=1.0, height=0.5,
+                  initial_x=4.0, initial_y=2.0, initial_z=4.0,
+                  device=device)
+    print(f"创建Agent: 位置=({agent.x}, {agent.y}, {agent.z})")
 
-vertex_shader = """
-#version 120
-attribute vec3 a_position;
-attribute vec3 a_offset;      // instance position
-attribute vec4 a_color;
+    # ========== Vispy 可视化 ==========
+    # 引入通用可视化工具
+    import sys
+    sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+    from utils.visualize import MapVisualizer
 
-varying vec4 v_color;
-uniform mat4 u_model;
-uniform mat4 u_view;
-uniform mat4 u_projection;
-
-void main() {
-    vec3 pos = a_position + a_offset;
-    gl_Position = u_projection * u_view * u_model * vec4(pos, 1.0);
-    v_color = a_color;
-}
-"""
-
-fragment_shader = """
-#version 120
-varying vec4 v_color;
-
-void main() {
-    gl_FragColor = v_color;
-}
-"""
-
-
-def make_unit_cube():
-    """Return (vertices, colors)"""
-    vertices = np.array([
-        # bottom
-        [-.5,-.5,-.5],[ .5,-.5,-.5],[ .5, .5,-.5],
-        [-.5,-.5,-.5],[ .5, .5,-.5],[-.5, .5,-.5],
-        # top
-        [-.5,-.5, .5],[ .5,-.5, .5],[ .5, .5, .5],
-        [-.5,-.5, .5],[ .5, .5, .5],[-.5, .5, .5],
-        # front
-        [-.5,-.5,-.5],[ .5,-.5,-.5],[ .5,-.5, .5],
-        [-.5,-.5,-.5],[ .5,-.5, .5],[-.5,-.5, .5],
-        # back
-        [-.5, .5,-.5],[ .5, .5,-.5],[ .5, .5, .5],
-        [-.5, .5,-.5],[ .5, .5, .5],[-.5, .5, .5],
-        # left
-        [-.5,-.5,-.5],[-.5, .5,-.5],[-.5, .5, .5],
-        [-.5,-.5,-.5],[-.5, .5, .5],[-.5,-.5, .5],
-        # right
-        [.5,-.5,-.5],[.5, .5,-.5],[.5, .5, .5],
-        [.5,-.5,-.5],[.5, .5, .5],[.5,-.5, .5],
-    ], dtype=np.float32)
-    return vertices
-
-
-# ============================================================
-# 4. 渲染类
-# ============================================================
-
-class VoxelCanvas(app.Canvas):
-    def __init__(self, grid):
-        app.Canvas.__init__(self, title="Voxel City", keys="interactive", size=(1200,800))
-
-        vox = get_exposed_voxels(grid)
-        print("Exposed voxels:", len(vox))
-
-        offsets = vox[:, :3].astype(np.float32)
-        colors = np.ones((len(vox), 4), dtype=np.float32)
-        colors[vox[:,3] == 1] = (0.1,0.1,0.1,1)
-        colors[vox[:,3] == 2] = (0.8,0.8,0.8,1)
-        colors[vox[:,3] == 3] = (0.6,0.3,0.1,1)
-
-        cube_v = make_unit_cube()
-
-        self.program = gloo.Program(vertex_shader, fragment_shader)
-
-        # cube vertices
-        self.program["a_position"] = cube_v
-
-        # instance attribute (Correct API)
-        self.program["a_offset"] = offsets
-        self.program["a_color"] = colors
-
-        # set instancing
-        gloo.set_vertex_attrib_divisor(self.program.attribute_buffers["a_offset"].buffer_id, 1)
-        gloo.set_vertex_attrib_divisor(self.program.attribute_buffers["a_color"].buffer_id, 1)
-
-        self.n_instances = len(offsets)
-        self.n_vertices = len(cube_v)
-
-        # transforms
-        self.theta = 30
-        self.phi = 35
-        self.distance = 200
-
-        self._timer = app.Timer("auto", connect=self.update, start=True)
-
-        self.show()
-
-    # ----------------------- camera -----------------------
-
-    def on_mouse_move(self, event):
-        if event.is_dragging:
-            dx, dy = event.delta
-            self.theta += dx * 0.5
-            self.phi += dy * 0.5
-
-    def on_mouse_wheel(self, event):
-        self.distance *= 0.9 ** event.delta[1]
-
-    # ----------------------- draw -------------------------
-
-    def on_draw(self, event):
-        gloo.clear(color="white", depth=True)
-
-        model = np.eye(4, dtype=np.float32)
-        view = np.eye(4, dtype=np.float32)
-
-        # camera rotation
-        rotate(view, self.theta, (0,1,0))
-        rotate(view, self.phi, (1,0,0))
-        translate(view, (0, 0, -self.distance))
-
-        proj = perspective(45.0, self.size[0]/self.size[1], 1.0, 1000.0)
-
-        self.program["u_model"] = model
-        self.program["u_view"] = view
-        self.program["u_projection"] = proj
-
-        # Draw instanced cube mesh
-        self.program.draw("triangles", instances=self.n_instances)
-
-
-# ============================================================
-# 5. 主入口
-# ============================================================
-
-if __name__ == "__main__":
-    city = generate_city()
-    canvas = VoxelCanvas(city)
-    app.run()
+    # 传入 device 以便 Visualizer 和 Cache 正确处理 GPU 数据
+    visualizer = MapVisualizer(title="Chunk可视化", device=device)
+    
+    # 根据Agent位置加载可见范围内所有chunk并可视化
+    chunks_to_render = visualizer.update_chunks(agent.x, agent.z, Chunk, HORIZON, device)
+    
+    # 可视化agent
+    visualizer.visualize_agent(agent)
+    
+    # 设置相机跟随Agent
+    world_max_y = Chunk.CHUNK_SIZE_Y * Chunk.VOXEL_SIZE
+    horizon_chunks = HORIZON.get("chunk_radius", 1) if isinstance(HORIZON, dict) else (HORIZON or 1)
+    camera_dist = max(world_max_y, horizon_chunks * Chunk.CHUNK_SIZE_X * Chunk.VOXEL_SIZE * 2)
+    visualizer.set_camera_target(np.array([agent.x, agent.y, agent.z]), distance=camera_dist)
+    
+    # ========== 键盘控制集成 ==========
+    from utils.control import KeyboardController
+    controller = KeyboardController(move_speed=Chunk.VOXEL_SIZE) # 每次移动一个体素大小
+    controller.bind_agent(agent)
+    controller.bind_visualizer(visualizer, camera_follow=True)
+    # 绑定Chunk更新参数，以便移动时自动加载地图
+    controller.bind_chunk_updater(Chunk, HORIZON, device)
+    
+    # 绑定事件到Canvas
+    visualizer.canvas.events.key_press.connect(controller.on_key_press)
+    visualizer.canvas.events.key_release.connect(controller.on_key_release)
+    
+    visualizer.run()

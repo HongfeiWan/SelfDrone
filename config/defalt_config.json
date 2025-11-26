@@ -1,0 +1,14 @@
+{
+    "horizon": 4,
+    "cache": {
+        "capacity": 256,
+        "save_dir": "map/chunks_cache"
+    },
+    "chunk": {
+        "CHUNK_SIZE_X": 16,
+        "CHUNK_SIZE_Z": 16,
+        "SECTION_HEIGHT":16,
+        "CHUNK_SIZE_Y": 256,
+        "VOXEL_SIZE": 0.5
+    }
+}
