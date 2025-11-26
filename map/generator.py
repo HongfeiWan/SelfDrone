@@ -32,6 +32,13 @@ class Section:
     def __init__(self, section_y: int, chunk, device):
         self.section_y = section_y  # 从chunk底部起第几层section
         self.chunk = chunk          # 所属chunk，可用于反查
+        # 稀疏存储：仅存储非空体素的坐标和值
+        # 格式：indices=(N, 3), values=(N,)
+        # 但为了保持与现有接口兼容，我们可能需要一个包装器或者修改访问方式
+        # 这里先用 dense tensor，后续优化为 sparse
+        # 根据用户请求：大部分是空气(0)，不需要存储
+        # PyTorch 稀疏张量支持有限，对于 uint8 可能更有限
+        # 简单方案：使用 Dense Tensor 但只在内存中，序列化时转为 Sparse 或 Coordinate List
         self.voxels = torch.zeros(
             (chunk.CHUNK_SIZE_X, chunk.CHUNK_SECTION_HEIGHT, chunk.CHUNK_SIZE_Z),
             dtype=torch.uint8, device=device)
@@ -51,11 +58,60 @@ class Chunk:
         self.chunk_z = chunk_z
         self.device = device
         self.num_sections = int(np.ceil(self.CHUNK_SIZE_Y / self.CHUNK_SECTION_HEIGHT))
-        # 直接分配全chunk四维大张量：[section, x, y_in_section, z]
+        
+        # 初始化为 None，表示全空（空气）
+        # 这是一个简单的稀疏优化：如果 voxels_all 为 None，则表示整个 Chunk 为空
+        # 或者，我们可以使用 PyTorch 的 sparse_coo_tensor
+        # 为了兼容性，先保留 dense tensor，但提供 compress/decompress 方法
+        # 用户意图是“存储时优化”，所以我们可以保持运行时 dense，存储时 sparse
+        
+        # 运行时：Dense Tensor (GPU)
         self.voxels_all = torch.zeros(
             (self.num_sections, self.CHUNK_SIZE_X, self.CHUNK_SECTION_HEIGHT, self.CHUNK_SIZE_Z),
             dtype=torch.uint8, device=device)
         self._generate_ground()
+
+    def compress(self):
+        """将体素数据压缩为稀疏格式（坐标列表），用于存储"""
+        # 只有非零值需要存储
+        indices = torch.nonzero(self.voxels_all, as_tuple=False) # (N, 4) -> [section, x, y, z]
+        if indices.shape[0] == 0:
+            return None
+        
+        values = self.voxels_all[indices[:, 0], indices[:, 1], indices[:, 2], indices[:, 3]]
+        # 返回稀疏表示：(indices, values, shape)
+        # 注意：indices 和 values 都在 GPU 上，可以直接返回
+        return {
+            'indices': indices,
+            'values': values,
+            'shape': self.voxels_all.shape
+        }
+
+    def decompress(self, sparse_data):
+        """从稀疏格式解压回 Dense Tensor"""
+        # 确保 voxels_all 已分配
+        if self.voxels_all is None:
+            self.voxels_all = torch.zeros(
+                (self.num_sections, self.CHUNK_SIZE_X, self.CHUNK_SECTION_HEIGHT, self.CHUNK_SIZE_Z),
+                dtype=torch.uint8, device=self.device)
+
+        if sparse_data is None:
+            # 全空
+            self.voxels_all.zero_()
+            return
+
+        indices = sparse_data['indices']
+        values = sparse_data['values']
+        shape = sparse_data['shape']
+        
+        # 确保 indices 和 values 在正确的设备上
+        if indices.device != self.device:
+            indices = indices.to(self.device)
+        if values.device != self.device:
+            values = values.to(self.device)
+            
+        self.voxels_all.zero_()
+        self.voxels_all[indices[:, 0], indices[:, 1], indices[:, 2], indices[:, 3]] = values
 
     @staticmethod
     def world_to_chunk_idx(x: float, z: float) -> Tuple[int, int]:
@@ -116,8 +172,37 @@ class Chunk:
         """将Chunk数据移动到指定设备"""
         if self.device != device:
             self.device = device
-            self.voxels_all = self.voxels_all.to(device)
+            if self.voxels_all is not None:
+                self.voxels_all = self.voxels_all.to(device)
+                 
+            # 同时移动压缩数据（如果存在）
+            if hasattr(self, 'compressed_data') and self.compressed_data is not None:
+                # compressed_data 是一个字典 {'indices': ..., 'values': ..., 'shape': ...}
+                for k, v in self.compressed_data.items():
+                    if hasattr(v, 'to'):
+                        self.compressed_data[k] = v.to(device)
         return self
+
+    def clone(self):
+        """创建Chunk的副本（深拷贝）"""
+        new_chunk = Chunk(self.chunk_x, self.chunk_z, self.device)
+        
+        # 复制稠密数据
+        if self.voxels_all is not None:
+            new_chunk.voxels_all = self.voxels_all.clone()
+        else:
+            new_chunk.voxels_all = None
+            
+        # 复制压缩数据
+        if hasattr(self, 'compressed_data') and self.compressed_data is not None:
+            new_chunk.compressed_data = {}
+            for k, v in self.compressed_data.items():
+                if hasattr(v, 'clone'):
+                    new_chunk.compressed_data[k] = v.clone()
+                else:
+                    new_chunk.compressed_data[k] = v # shape等元数据
+                    
+        return new_chunk
 
 class Agent:
     """
@@ -128,6 +213,9 @@ class Agent:
                  initial_x: float = 0.0, initial_y: float = 0.0, initial_z: float = 0.0,
                  initial_qw: float = 1.0, initial_qx: float = 0.0, 
                  initial_qy: float = 0.0, initial_qz: float = 0.0,
+                 fov_lat_range: Tuple[float, float] = (-7.0, 52.0),
+                 fov_lon_range: Tuple[float, float] = (0.0, 360.0),
+                 sensor_mount_rotation: Tuple[float, float, float] = (0.0, 0.0, -30.0),
                  device: Optional[torch.device] = None):
         """
         初始化Agent
@@ -142,6 +230,9 @@ class Agent:
             initial_qx: 初始四元数x分量（姿态）
             initial_qy: 初始四元数y分量（姿态）
             initial_qz: 初始四元数z分量（姿态）
+            fov_lat_range: 视角的纬度范围 (min_pitch, max_pitch)，单位度。默认(-7, 52)。
+            fov_lon_range: 视角的经度范围 (min_yaw, max_yaw)，单位度。默认(0, 360)。
+            sensor_mount_rotation: 传感器相对于Agent本体坐标系的安装角度偏移 (pitch_offset, yaw_offset, roll_offset)，单位度。
             device: 计算设备（GPU或CPU）
         """
         self.length = length      # x方向长度
@@ -158,6 +249,11 @@ class Agent:
         self.qx = initial_qx
         self.qy = initial_qy
         self.qz = initial_qz
+
+        # 传感器/视角参数
+        self.fov_lat_range = fov_lat_range
+        self.fov_lon_range = fov_lon_range
+        self.sensor_mount_rotation = sensor_mount_rotation # (pitch, yaw, roll) offset in degrees
 
         self.device = device if device is not None else torch.device("cpu")
     
@@ -223,16 +319,17 @@ if __name__=="__main__":
     visualizer = MapVisualizer(title="Chunk可视化", device=device)
     
     # 根据Agent位置加载可见范围内所有chunk并可视化
-    chunks_to_render = visualizer.update_chunks(agent.x, agent.z, Chunk, HORIZON, device)
+    # 返回值为 (N, 2) 的 IntTensor，每行 [chunk_x, chunk_z]
+    visible_chunk_indices = visualizer.update_chunks(agent.x, agent.z, Chunk, HORIZON, device)
     
-    # 可视化agent
-    visualizer.visualize_agent(agent)
+    # 初始时同时可视化 Agent 和其观测到的 Sections
+    visualizer.update_agent_visuals(agent, visible_chunk_indices)
     
     # 设置相机跟随Agent
     world_max_y = Chunk.CHUNK_SIZE_Y * Chunk.VOXEL_SIZE
     horizon_chunks = HORIZON.get("chunk_radius", 1) if isinstance(HORIZON, dict) else (HORIZON or 1)
     camera_dist = max(world_max_y, horizon_chunks * Chunk.CHUNK_SIZE_X * Chunk.VOXEL_SIZE * 2)
-    visualizer.set_camera_target(np.array([agent.x, agent.y, agent.z]), distance=camera_dist)
+
     
     # ========== 键盘控制集成 ==========
     from utils.control import KeyboardController
@@ -241,9 +338,17 @@ if __name__=="__main__":
     controller.bind_visualizer(visualizer, camera_follow=True)
     # 绑定Chunk更新参数，以便移动时自动加载地图
     controller.bind_chunk_updater(Chunk, HORIZON, device)
+    # 将初始可见的 Chunk 索引传递给控制器，用于后续 Section 可视化
+    controller.visible_chunk_indices = visible_chunk_indices
     
     # 绑定事件到Canvas
     visualizer.canvas.events.key_press.connect(controller.on_key_press)
     visualizer.canvas.events.key_release.connect(controller.on_key_release)
     
-    visualizer.run()
+    try:
+        visualizer.run()
+    finally:
+        # 程序退出时保存地图
+        if hasattr(visualizer, 'chunk_cache'):
+            visualizer.chunk_cache.save_to_disk()
+            #visualizer.chunk_cache.clear_disk_cache() # 可选：是否保留历史

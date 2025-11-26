@@ -1,9 +1,13 @@
 {
     "horizon": 4,
+
+    "mapsize":1024,
+
     "cache": {
         "capacity": 256,
         "save_dir": "map/chunks_cache"
     },
+    
     "chunk": {
         "CHUNK_SIZE_X": 16,
         "CHUNK_SIZE_Z": 16,

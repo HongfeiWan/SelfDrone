@@ -22,6 +22,8 @@ class KeyboardController:
         self.horizon = None
         self.device = None
         self.last_chunk_idx = None
+        # 当前视野内的 Chunk 索引张量 (N, 2)，由 visualizer.update_chunks 返回
+        self.visible_chunk_indices = None
         
     def bind_agent(self, agent: Any):
         """绑定要控制的Agent"""
@@ -96,14 +98,14 @@ class KeyboardController:
                     current_chunk_idx = self.chunk_class.world_to_chunk_idx(self.agent.x, self.agent.z)
                     if current_chunk_idx != self.last_chunk_idx:
                         print(f"Agent跨越Chunk边界: {self.last_chunk_idx} -> {current_chunk_idx}，更新地图...")
-                        self.visualizer.update_chunks(
+                        self.visible_chunk_indices = self.visualizer.update_chunks(
                             self.agent.x, self.agent.z, 
                             self.chunk_class, self.horizon, self.device
                         )
                         self.last_chunk_idx = current_chunk_idx
 
-                # 2. 更新Agent本身的可视化
-                self.visualizer.update_agent_visuals(self.agent)
+                # 2. 更新Agent本身的可视化（叠加当前可见 Section）
+                self.visualizer.update_agent_visuals(self.agent, self.visible_chunk_indices)
                 
                 # 3. 相机跟随
                 if self.camera_follow:
