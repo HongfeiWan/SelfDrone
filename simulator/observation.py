@@ -107,13 +107,132 @@ class ObservationSystem:
             if candidate_sections.shape[0] == 0:
                 return candidate_sections
 
-        # 3. TODO: 实现精确的视锥剔除
-        #    - 计算每个 Section 的 AABB 中心/角点
-        #    - 使用 Agent 姿态 + 传感器安装角 (fov_lat_range, fov_lon_range, sensor_mount_rotation)
-        #      将这些点变换到传感器坐标系，筛选在视锥内的 Section
-        #    目前先返回 AABB + horizon 过滤后的结果
+        # 3. 精确的视锥剔除：将 Section 中心点转换到传感器坐标系，用 FOV 角度范围筛选
+        if not (hasattr(agent, 'fov_lat_range') and hasattr(agent, 'fov_lon_range')):
+            # 如果没有 FOV 配置，直接返回 AABB + horizon 过滤结果
+            return candidate_sections
 
-        return candidate_sections
+        # 3.1 计算每个 Section 的中心点（世界坐标）
+        voxel_size = Chunk.VOXEL_SIZE
+        section_size_x = Chunk.CHUNK_SIZE_X * voxel_size
+        section_size_z = Chunk.CHUNK_SIZE_Z * voxel_size
+        section_size_y = Chunk.CHUNK_SECTION_HEIGHT * voxel_size
+
+        # candidate_sections: (N, 3) -> [chunk_x, section_y, chunk_z]
+        # 计算每个 section 的中心点（世界坐标）
+        section_centers_world = torch.zeros(
+            (candidate_sections.shape[0], 3), 
+            dtype=torch.float32, 
+            device=self.device
+        )
+        section_centers_world[:, 0] = candidate_sections[:, 0].float() * section_size_x + section_size_x * 0.5
+        section_centers_world[:, 1] = candidate_sections[:, 1].float() * section_size_y + section_size_y * 0.5
+        section_centers_world[:, 2] = candidate_sections[:, 2].float() * section_size_z + section_size_z * 0.5
+
+        # 3.2 转换到 Agent body 坐标系
+        # Agent 位置（世界坐标）
+        agent_pos = torch.tensor(
+            [agent.x, agent.y + agent.height * 0.5, agent.z],
+            dtype=torch.float32,
+            device=self.device
+        )
+        # 相对于 Agent 的向量
+        vec_to_section = section_centers_world - agent_pos.unsqueeze(0)  # (N, 3)
+
+        # 四元数转旋转矩阵（Body -> World）
+        qw, qx, qy, qz = agent.qw, agent.qx, agent.qy, agent.qz
+        # 归一化
+        q_norm = torch.sqrt(torch.tensor(qw*qw + qx*qx + qy*qy + qz*qz, dtype=torch.float32, device=self.device)) + 1e-9
+        qw, qx, qy, qz = qw/q_norm, qx/q_norm, qy/q_norm, qz/q_norm
+
+        # 旋转矩阵 R_body_world（列向量是 body 坐标轴在世界坐标系的方向）
+        # R = [1-2y^2-2z^2, 2xy-2wz,     2xz+2wy]
+        #     [2xy+2wz,     1-2x^2-2z^2, 2yz-2wx]
+        #     [2xz-2wy,     2yz+2wx,     1-2x^2-2y^2]
+        R_bw = torch.tensor([
+            [1 - 2*(qy*qy + qz*qz), 2*(qx*qy + qw*qz),     2*(qx*qz - qw*qy)],
+            [2*(qx*qy - qw*qz),     1 - 2*(qx*qx + qz*qz), 2*(qy*qz + qw*qx)],
+            [2*(qx*qz + qw*qy),     2*(qy*qz - qw*qx),     1 - 2*(qx*qx + qy*qy)]
+        ], dtype=torch.float32, device=self.device)
+
+        # World -> Body: R_world_body = R_body_world^T
+        R_wb = R_bw.T
+        vec_body = vec_to_section @ R_wb.T  # (N, 3)
+
+        # 3.3 转换到传感器坐标系（应用 sensor_mount_rotation）
+        mount_rot = getattr(agent, 'sensor_mount_rotation', (0.0, 0.0, 0.0))
+        pitch, yaw, roll = torch.tensor(mount_rot, dtype=torch.float32, device=self.device)
+        p, y, r = torch.deg2rad(pitch), torch.deg2rad(yaw), torch.deg2rad(roll)
+
+        # 欧拉角转旋转矩阵：R_sensor_body（Roll -> Pitch -> Yaw）
+        cos_p, sin_p = torch.cos(p), torch.sin(p)
+        cos_y, sin_y = torch.cos(y), torch.sin(y)
+        cos_r, sin_r = torch.cos(r), torch.sin(r)
+
+        Rx = torch.tensor([
+            [1, 0, 0],
+            [0, cos_p, -sin_p],
+            [0, sin_p, cos_p]
+        ], dtype=torch.float32, device=self.device)
+
+        Ry = torch.tensor([
+            [cos_y, 0, sin_y],
+            [0, 1, 0],
+            [-sin_y, 0, cos_y]
+        ], dtype=torch.float32, device=self.device)
+
+        Rz = torch.tensor([
+            [cos_r, -sin_r, 0],
+            [sin_r, cos_r, 0],
+            [0, 0, 1]
+        ], dtype=torch.float32, device=self.device)
+
+        R_sb = Ry @ Rx @ Rz  # (3, 3)
+        vec_sensor = vec_body @ R_sb.T  # (N, 3)
+
+        # 3.4 转换为球坐标（lat, lon）
+        # 传感器坐标系：Y-up, Z-forward
+        # x = r * cos(lat) * sin(lon)
+        # y = r * sin(lat)
+        # z = r * cos(lat) * cos(lon)
+        r = torch.norm(vec_sensor, dim=1, keepdim=True)  # (N, 1)
+        r = torch.clamp(r, min=1e-6)  # 避免除零
+
+        # lat (pitch): lat = arcsin(y / r)
+        lat_rad = torch.asin(vec_sensor[:, 1] / r.squeeze(1))  # (N,)
+        lat_deg = torch.rad2deg(lat_rad)  # (N,)
+
+        # lon (yaw): lon = atan2(x, z)
+        lon_rad = torch.atan2(vec_sensor[:, 0], vec_sensor[:, 2])  # (N,)
+        lon_deg = torch.rad2deg(lon_rad)  # (N,)
+        # 归一化到 [0, 360)
+        lon_deg = torch.where(lon_deg < 0, lon_deg + 360.0, lon_deg)
+
+        # 3.5 判断是否在 FOV 盲区范围内
+        # FOV 范围定义的是"盲区"（不可见区域），在盲区内的点看不到，盲区外的点可以看到
+        lat_min, lat_max = agent.fov_lat_range
+        lon_min, lon_max = agent.fov_lon_range
+
+        # 纬度范围检查：是否在盲区锥形内
+        lat_in_blind = (lat_deg >= lat_min) & (lat_deg <= lat_max)
+
+        # 经度范围检查：是否在盲区锥形内（处理跨 0 度的情况，例如 [350, 10]）
+        if lon_max >= lon_min:
+            lon_in_blind = (lon_deg >= lon_min) & (lon_deg <= lon_max)
+        else:
+            # 跨 0 度：例如 [350, 10] -> lon >= 350 或 lon <= 10 表示在盲区内
+            lon_in_blind = (lon_deg >= lon_min) | (lon_deg <= lon_max)
+
+        # 组合掩码：在盲区锥形内的点（lat 和 lon 都在盲区范围内）
+        blind_zone_mask = lat_in_blind & lon_in_blind
+
+        # 可见区域 = 不在盲区内的点
+        visible_mask = ~blind_zone_mask
+
+        # 3.6 应用视锥剔除：只保留可见区域内的 sections
+        visible_sections = candidate_sections[visible_mask]
+
+        return visible_sections
 
     def get_observed_chunk_indices(self, agent_x: float, agent_z: float, ChunkClass: Any, horizon: Any) -> torch.Tensor:
         """
